@@ -47,6 +47,7 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
+<<<<<<< HEAD
 # local tools
 .antigravitycli/
 
@@ -75,3 +76,7 @@ downloads/
 
 # PR review artifacts
 pr-*-review*.md
+
+# Nix
+result
+vendor
