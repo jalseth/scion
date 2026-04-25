@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-# Build Scion container images locally using docker buildx.
+# Build Scion container images locally using podman or docker.
 #
 # Usage:
 #   build-images.sh --registry <registry> [--target <target>] [--push] [--platform <platforms>] [--tag <tag>]
@@ -37,11 +37,22 @@ TAG="latest"
 
 HARNESSES=(claude gemini opencode codex)
 
+# Detect container engine: prefer podman if available, fall back to docker.
+if command -v podman &>/dev/null; then
+  ENGINE="podman"
+elif command -v docker &>/dev/null; then
+  ENGINE="docker"
+else
+  echo "Error: neither podman nor docker found in PATH"
+  exit 1
+fi
+echo "Using container engine: ${ENGINE}"
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") --registry <registry> [options]
 
-Build Scion container images locally using docker buildx.
+Build Scion container images locally using podman or docker.
 
 Required:
   --registry <path>    Target registry path (e.g., ghcr.io/myorg)
@@ -92,9 +103,9 @@ if [[ -n "${PLATFORM}" ]]; then
   fi
 fi
 
-# When doing multi-platform builds without --push, we need --load for single
-# platform or must push (buildx limitation). Warn the user.
-if [[ ${#PLATFORM_ARGS[@]} -gt 0 && -z "${PUSH}" ]]; then
+# When doing multi-platform builds without --push using docker buildx, we need
+# --load for single platform or must push (buildx limitation). Warn the user.
+if [[ "${ENGINE}" == "docker" && ${#PLATFORM_ARGS[@]} -gt 0 && -z "${PUSH}" ]]; then
   PLAT_VAL="${PLATFORM_ARGS[1]}"
   if [[ "${PLAT_VAL}" == *","* ]]; then
     echo "Warning: Multi-platform builds require --push. Adding --push automatically."
@@ -103,12 +114,30 @@ if [[ ${#PLATFORM_ARGS[@]} -gt 0 && -z "${PUSH}" ]]; then
 fi
 
 LOAD_ARG=""
-if [[ -z "${PUSH}" ]]; then
+if [[ "${ENGINE}" == "docker" && -z "${PUSH}" ]]; then
   LOAD_ARG="--load"
 fi
 
-# Ensure buildx builder exists
+# Build command prefix: docker uses buildx, podman builds natively.
+if [[ "${ENGINE}" == "docker" ]]; then
+  BUILD_CMD=(docker buildx build)
+else
+  BUILD_CMD=(podman build)
+fi
+
+# When using podman, builds that reference locally-built base images (via
+# BASE_IMAGE) need --pull=never so podman resolves them from local storage
+# instead of treating the registry prefix as a remote hostname.
+LOCAL_BASE_ARGS=()
+if [[ "${ENGINE}" == "podman" ]]; then
+  LOCAL_BASE_ARGS=(--pull=never)
+fi
+
+# Ensure buildx builder exists (docker only).
 ensure_builder() {
+  if [[ "${ENGINE}" != "docker" ]]; then
+    return
+  fi
   if ! docker buildx inspect scion-builder &>/dev/null; then
     echo "Creating buildx builder 'scion-builder'..."
     docker buildx create --name scion-builder --use
@@ -120,7 +149,7 @@ ensure_builder() {
 
 build_core_base() {
   echo "==> Building core-base..."
-  docker buildx build \
+  "${BUILD_CMD[@]}" \
     ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} \
     -t "${REGISTRY}/core-base:${TAG}" \
     -f "${IMAGE_BUILD_DIR}/core-base/Dockerfile" \
@@ -132,8 +161,9 @@ build_core_base() {
 build_scion_base() {
   local base_tag="${1:-latest}"
   echo "==> Building scion-base..."
-  docker buildx build \
+  "${BUILD_CMD[@]}" \
     ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} \
+    ${LOCAL_BASE_ARGS[@]+"${LOCAL_BASE_ARGS[@]}"} \
     --build-arg "BASE_IMAGE=${REGISTRY}/core-base:${base_tag}" \
     --build-arg "GIT_COMMIT=$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)" \
     -t "${REGISTRY}/scion-base:${TAG}" \
@@ -147,8 +177,9 @@ build_harness() {
   local name="$1"
   local base_tag="${2:-latest}"
   echo "==> Building scion-${name}..."
-  docker buildx build \
+  "${BUILD_CMD[@]}" \
     ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} \
+    ${LOCAL_BASE_ARGS[@]+"${LOCAL_BASE_ARGS[@]}"} \
     --build-arg "BASE_IMAGE=${REGISTRY}/scion-base:${base_tag}" \
     -t "${REGISTRY}/scion-${name}:${TAG}" \
     -f "${IMAGE_BUILD_DIR}/${name}/Dockerfile" \
@@ -169,7 +200,7 @@ ensure_builder
 
 case "${TARGET}" in
   common)
-    build_scion_base "latest"
+    build_scion_base "${TAG}"
     build_all_harnesses "${TAG}"
     ;;
   all)
@@ -181,7 +212,7 @@ case "${TARGET}" in
     build_core_base
     ;;
   harnesses)
-    build_all_harnesses "latest"
+    build_all_harnesses "${TAG}"
     ;;
   *)
     echo "Unknown target: ${TARGET}"
